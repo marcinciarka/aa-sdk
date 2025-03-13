@@ -5,9 +5,11 @@ import com.alchemy.aa.Stamper.Stamp;
 import com.alchemy.aa.client.api.AuthJWT.Request;
 import com.alchemy.aa.client.api.AuthJWT.Response;
 import com.alchemy.aa.client.api.AuthUser;
+import com.alchemy.aa.client.api.AuthUser.TurnKeyWhoAmIRequest;
 import com.alchemy.aa.client.api.AuthUser.WhoAmIRequest;
 import com.alchemy.aa.client.api.GetUser;
-import com.alchemy.aa.client.api.SignRawMessage.SignParamter;
+import com.alchemy.aa.client.api.SignRawMessage.SignParameters;
+import com.alchemy.aa.client.api.SignRawMessage.SignRawMessageRequest;
 import com.alchemy.aa.client.api.SignRawMessage.SignedResponse;
 import com.alchemy.aa.client.api.SignRawMessage.SigningBody;
 import com.alchemy.aa.client.api.StampedRequest;
@@ -35,7 +37,7 @@ public class SignerClient {
 
     @Getter
     public enum PathName {
-        LOOKUP("lookup"), AUTH("auth"), AUTH_JWT("auth_jwt"), WHOAMI("whoami"), SIGN_PAYLOAD("sign-payload");
+        LOOKUP("lookup"), AUTH("auth"), AUTH_JWT("auth-jwt"), WHOAMI("whoami"), SIGN_PAYLOAD("sign-payload");
 
         private final String name;
 
@@ -47,6 +49,9 @@ public class SignerClient {
     public enum SigningMode {
         ETHEREUM, SOLANA
     }
+
+    private final HttpConfig httpConfig;
+    private final ObjectMapper mapper;
 
     public SignerClient(HttpConfig httpConfig) {
         this.httpConfig = httpConfig;
@@ -62,7 +67,7 @@ public class SignerClient {
      * @param bundle
      *            bundle from alchemy signer service.
      *
-     * @return
+     * @return authenticated user
      *
      * @throws Exception
      */
@@ -75,7 +80,7 @@ public class SignerClient {
 
     public User authenticateWithJWT(Stamper stamper, String jwt, String authProviderName, int expirationInSeconds)
             throws Exception {
-        Request request = Request.builder().jwt(jwt).authProviderName(authProviderName)
+        Request request = Request.builder().jwt(jwt).authProvider(authProviderName)
                 .targetPublicKey(stamper.publicKey()).build();
 
         Response response = this.request(PathName.AUTH_JWT.getName(), request, Response.class);
@@ -99,24 +104,24 @@ public class SignerClient {
      *
      * @throws Exception
      */
-    public Bytes signRawMessage(Stamper stamper, User user, Bytes msg, SigningMode mode, String hashFunction,
+    public String signRawMessage(Stamper stamper, User user, Bytes msg, SigningMode mode, String hashFunction,
             String address) throws Exception {
         ObjectWriter writer = this.mapper.writerWithDefaultPrettyPrinter();
 
-        SignParamter signParamter = SignParamter.builder().encoding("PAYLOAD_ENCODING_HEXADECIMAL")
-                .hashfunction(hashFunction).payload(msg.toString()).signWith(address).build();
+        SignParameters signParameters = SignParameters.builder().encoding("PAYLOAD_ENCODING_HEXADECIMAL")
+                .hashFunction(hashFunction).payload( Hex.toHexString(msg.toByteArray()) ).signWith(address).build();
 
         SigningBody body = SigningBody.builder().organizationId(user.orgId).type("ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2")
-                .timestampMs(String.valueOf(Instant.now().toEpochMilli())).parameters(signParamter).build();
+                .timestampMs(String.valueOf(Instant.now().toEpochMilli())).parameters(signParameters).build();
 
         String json_body = writer.writeValueAsString(body);
 
         Stamp stamp = stamper.stamp(json_body);
-        StampedRequest request = StampedRequest.builder()
+        StampedRequest stampedRequest = StampedRequest.builder()
                 .url("https://api.turnkey.com/public/v1/submit/sign_raw_payload").body(json_body).stamp(stamp).build();
-
+        SignRawMessageRequest request = new SignRawMessageRequest(stampedRequest);
         SignedResponse response = this.request(PathName.SIGN_PAYLOAD.getName(), request, SignedResponse.class);
-        return Bytes.copyFrom(Hex.decode(response.signature()));
+        return (response.signature());
     }
 
     /**
@@ -129,7 +134,7 @@ public class SignerClient {
      *
      * @throws Exception
      */
-    public Bytes signSolanaTx(Stamper stamper, User user, Bytes txBytes) throws Exception {
+    public String signSolanaTx(Stamper stamper, User user, Bytes txBytes) throws Exception {
         return this.signRawMessage(stamper, user, txBytes, SigningMode.SOLANA, "HASH_FUNCTION_NOT_APPLICABLE",
                 user.solanaAddress);
     }
@@ -148,7 +153,7 @@ public class SignerClient {
      *
      * @throws Exception
      */
-    public Bytes signEthTx(Stamper stamper, User user, Bytes txBytes) throws Exception {
+    public String signEthTx(Stamper stamper, User user, Bytes txBytes) throws Exception {
         return this.signRawMessage(stamper, user, txBytes, SigningMode.ETHEREUM, "HASH_FUNCTION_NO_OP", user.address);
     }
 
@@ -186,9 +191,10 @@ public class SignerClient {
         WhoAmIRequest whoAmIRequest = new WhoAmIRequest(orgId);
         ObjectWriter writer = this.mapper.writerWithDefaultPrettyPrinter();
         String json_body = writer.writeValueAsString(whoAmIRequest);
-        Stamp stamped_body = stamper.stamp(json_body);
-        StampedRequest request = StampedRequest.builder().url("https://api.whoami.com/v1/users/").body(json_body)
-                .stamp(stamped_body).build();
+        Stamp stampedBody = stamper.stamp(json_body);
+        StampedRequest stampedRequestrequest = StampedRequest.builder().url("https://api.whoami.com/v1/users/").body(json_body)
+                .stamp(stampedBody).build();
+        TurnKeyWhoAmIRequest request = new TurnKeyWhoAmIRequest(stampedRequestrequest);
         AuthUser.Response response = this.request(PathName.WHOAMI.getName(), request, AuthUser.Response.class);
         return User.builder().address(response.address()).orgId(response.orgId()).userId(response.userId())
                 .email(response.email()).solanaAddress(response.solanaAddress()).build();
@@ -197,19 +203,16 @@ public class SignerClient {
 
     private <Request, Response> Response request(String path, Request request, Class<Response> clazz) throws Exception {
 
-        URI uri = URI.create(this.httpConfig.getUrl());
-        uri.resolve(path);
+        URI uri = URI.create(this.httpConfig.getUrl()).resolve(path);
         HttpRequest http_request = HttpRequest.newBuilder().uri(uri).header("accept", "application/json")
                 .header("content-type", "application/json")
                 .header("Authorization", "Bearer " + this.httpConfig.getApiKey())
                 .method("POST", HttpRequest.BodyPublishers.ofString(this.mapper.writeValueAsString(request))).build();
+
         JacksonBodyHandlers jsonBodyHandler = new JacksonBodyHandlers(this.mapper);
 
-        HttpResponse<Response> response = HttpClient.newHttpClient().send(http_request,
-                jsonBodyHandler.handlerFor(clazz));
-        return response.body();
+        HttpResponse<String> response = HttpClient.newHttpClient().send(http_request,
+            HttpResponse.BodyHandlers.ofString());
+        return  mapper.readValue(response.body(), clazz);
     }
-
-    private HttpConfig httpConfig;
-    private ObjectMapper mapper;
 }
